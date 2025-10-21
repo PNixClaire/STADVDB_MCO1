@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets & local config
+.env
+config.py
+*.sqlite3
+
+# Local data sources (don’t push to GitHub)
+data_sources/
+IMDB/
+U.S. Weekend Box Office Summaries/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.zip
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
