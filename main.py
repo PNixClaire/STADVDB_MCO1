@@ -1,5 +1,5 @@
 import argparse
-from loaders.books_loader import load_books
+from loaders.books_loader import load_dw_from_books_csv
 from loaders.books_films_reviews_loader import load_dw_from_bfr
 from loaders.tmdb_loader import load_tmdb
 from loaders.imdb_loader import load_imdb
@@ -17,7 +17,7 @@ def main():
     p.add_argument("--all", action="store_true")
     args = p.parse_args()
 
-    if args.all or args.books:                 load_books()
+    if args.all or args.books: load_dw_from_books_csv()
     if args.all or args.bfr:   load_dw_from_bfr()
     if args.all or args.tmdb:           load_tmdb()
     if args.all or args.imdb:           load_imdb()

@@ -1,181 +1,207 @@
-# loaders/books_loader.py
+import pandas as pd
+import sqlite3, os, re
 from sqlalchemy import create_engine, text
-import pandas as pd, os, re
+from datetime import datetime, date
 from config import PG_URL, BOOKS_PATH
 
-def _read_books(path: str) -> pd.DataFrame:
-    if not path or not os.path.exists(path):
-        raise FileNotFoundError(f"Books file not found: {path}")
+DW_SCHEMA = "dw_books_movies" #our star schema where the data will be loaded
 
-    ext = os.path.splitext(path)[1].lower()
-    common_kwargs = dict(dtype={
-        "book_id": "Int64",
-        "isbn": "string",
-        "isbn13": "string",
-        "title": "string",
-        "authors": "string",
-        "language_code": "string",
-        "average_rating": "float64",
-        "ratings_count": "Int64",
-        "text_reviews_count": "Int64",
-        "publication_date": "string",
-    })
+def _derive_movie_id_source_from_imdb(imdb_id: str | None) -> str | None:
+    #movie natural key from IMDb so we can upsert easily
+    if not imdb_id or not isinstance(imdb_id, str):
+        return None
+    # --- MODIFIED: Handle 'tt' prefix or just the number ---
+    m = re.search(r"tt?(\d+)", imdb_id.strip())
+    return m.group(1) if m else None
 
-    if ext in [".csv", ".txt"]:
-        # robust CSV read: handles quotes/embedded commas; skip truly bad lines
-        return pd.read_csv(
-            path,
-            engine="python",
-            sep=",",
-            quotechar='"',
-            escapechar="\\",
-            on_bad_lines="skip",
-            **common_kwargs
-        )
-    elif ext in [".xlsx", ".xls"]:
-        return pd.read_excel(path, **common_kwargs)
-    else:
-        raise ValueError(f"Unsupported Goodreads file type: {ext}")
+def _coerce_date(val) -> date | None:
+    if val is None:
+        return None
+    try:
+        # --- MODIFIED: Handle various date formats, including just year ---
+        if isinstance(val, (int, float)) and 1800 < val < 2100:
+             # Handle integer years
+            return date(int(val), 1, 1)
+        
+        dt = pd.to_datetime(val, errors="coerce")
+        if pd.isna(dt):
+            # Try parsing just the year if full parse fails
+            m = re.search(r"(\d{4})", str(val))
+            if m:
+                return date(int(m.group(1)), 1, 1)
+            return None
+        return dt.date()
+    except Exception:
+        return None
 
-def load_books():
-    path = BOOKS_PATH
-    if not path or not os.path.exists(path):
-        print(f"Books file not found: {path}")
+#date
+def _date_to_sk(d: date) -> int:
+    # YYYYMMDD as int
+    return d.year * 10000 + d.month * 100 + d.day
+
+def _safe_float(v, lo=None, hi=None):
+    try:
+        f = float(v)
+        if lo is not None and f < lo: return None
+        if hi is not None and f > hi: return None
+        return f
+    except Exception:
+        return None
+    
+def _safe_int(v):
+        try:
+            return int(float(v)) # --- MODIFIED: Cast via float to handle "123.0" ---
+        except Exception:
+            return None 
+
+#load the data from the source --> eto lang nabago
+def load_dw_from_books_csv():
+    """
+    Loads data from the books.csv file into Dim_Book and backfills
+    measures into Fact_Book_Adaptation.
+    """
+    print("\nStarting books.csv load...")
+    if not BOOKS_PATH or not os.path.exists(BOOKS_PATH):
+        print(f"books.csv not found: {BOOKS_PATH}")
         return
 
-    engine = create_engine(PG_URL)
-    df = _read_books(path)
+    pg = create_engine(PG_URL)
+    
+    # --- 1. Read CSV ---
+    try:
+        # Use on_bad_lines='skip' as this CSV is known to have some formatting errors
+        books_df = pd.read_csv(BOOKS_PATH, on_bad_lines='skip') 
+    except Exception as e:
+        print(f"Error reading CSV file at {BOOKS_PATH}: {e}")
+        return
+        
+    books_df.columns = [c.strip().lower() for c in books_df.columns]
 
-    # 🔧 Normalize headers: strip, lowercase, remove BOMs
-    df.columns = [str(c).strip().lower().replace("\ufeff", "") for c in df.columns]
+    # --- 2. Check for essential column ---
+    if 'bookid' not in books_df.columns:
+        print("Error: 'bookID' column not found. Check CSV header.")
+        print(f"Found columns: {books_df.columns.tolist()}")
+        return
 
-    # If your file uses slight variants, fix them here
-    aliases = {
-        "bookid": "book_id",
-        "text_reviews_count": "work_text_reviews_count",  # our staging column
-        "publication_date ": "publication_date",
-    }
-    df = df.rename(columns={k: v for k, v in aliases.items() if k in df.columns})
+    print(f"Loaded {len(books_df)} rows from books.csv")
 
-    # Normalize column names the dataset actually uses
-    rename_map = {
-        "book_id": "book_id",
-        "title": "title",
-        "authors": "authors",
-        "average_rating": "average_rating",
-        "language_code": "language_code",
-        "isbn": "isbn",
-        "isbn13": "isbn13",
-        "ratings_count": "ratings_count",
-        "work_text_reviews_count": "work_text_reviews_count",
-        "publication_date": "publication_date",
-    }
-    df = df.rename(columns=rename_map)
+    fact_update_data = [] # To store data for fact update
+    processed_books = 0
+    updated_facts = 0
 
-    # Derive original_publication_year from publication_date (if present)
-    if "publication_date" in df.columns:
-        df["original_publication_year"] = pd.to_datetime(
-            df["publication_date"], errors="coerce"
-        ).dt.year
-    else:
-        df["original_publication_year"] = pd.NA
+    with pg.begin() as c:
+        c.execute(text(f"SET search_path TO {DW_SCHEMA}"))
+        print("Upserting data into Dim_Book...")
 
-    keep = [
-        "book_id","title","authors","average_rating","language_code",
-        "isbn","isbn13","ratings_count","work_text_reviews_count",
-        "original_publication_year"
-    ]
-    for k in keep:
-        if k not in df.columns:
-            df[k] = pd.NA
-
-    # 🔧 Coerce book_id to numeric so NA/garbage becomes NaN (and gets dropped)
-    df["book_id"] = pd.to_numeric(df["book_id"], errors="coerce")
-
-    books_df = df[keep].dropna(subset=["book_id"]).copy()
-    books_df["book_id"] = books_df["book_id"].astype(int)
-
-    print("after-rename rows =", len(df))
-    print("to-insert rows    =", len(books_df))
-
-    with engine.begin() as c:
-        c.execute(text("SET search_path TO source_books_movies"))
-
-        # Upsert books
-        rows = books_df.to_dict(orient="records")
-        for r in rows:
-            c.execute(text("""
-                INSERT INTO books
-                  (book_id, title, authors, average_rating, language_code, isbn, isbn13,
-                   ratings_count, work_text_reviews_count, original_publication_year)
-                VALUES
-                  (:book_id, :title, :authors, :avg, :lang, :isbn, :isbn13,
-                   :rc, :trc, :opy)
-                ON CONFLICT (book_id) DO UPDATE SET
-                  title                     = EXCLUDED.title,
-                  authors                   = EXCLUDED.authors,
-                  average_rating            = EXCLUDED.average_rating,
-                  language_code             = EXCLUDED.language_code,
-                  isbn                      = EXCLUDED.isbn,
-                  isbn13                    = EXCLUDED.isbn13,
-                  ratings_count             = EXCLUDED.ratings_count,
-                  work_text_reviews_count   = EXCLUDED.work_text_reviews_count,
-                  original_publication_year = EXCLUDED.original_publication_year;
-            """), {
-                "book_id": int(r["book_id"]),
-                "title": None if pd.isna(r["title"]) else str(r["title"]),
-                "authors": None if pd.isna(r["authors"]) else str(r["authors"]),
-                "avg":   None if pd.isna(r["average_rating"]) else float(r["average_rating"]),
-                "lang":  None if pd.isna(r["language_code"]) else str(r["language_code"]),
-                "isbn":  None if pd.isna(r["isbn"]) else str(r["isbn"]),
-                "isbn13":None if pd.isna(r["isbn13"]) else str(r["isbn13"]),
-                "rc":    None if pd.isna(r["ratings_count"]) else int(r["ratings_count"]),
-                "trc":   None if pd.isna(r["work_text_reviews_count"]) else int(r["work_text_reviews_count"]),
-                "opy":   None if pd.isna(r["original_publication_year"]) else int(r["original_publication_year"]),
-            })
-
-        # Build authors + mapping from the 'authors' column (comma-separated)
-        author_by_name = {}
-        for r in rows:
-            if pd.isna(r["authors"]):
+        # --- 3. Upsert Dim_Book ---
+        for _, r in books_df.iterrows():
+            book_id_source = r.get('bookid')
+            if pd.isna(book_id_source):
                 continue
-            raw = str(r["authors"])
+            
+            # Clean book_id_source (it's often a float: 1.0) to match our string key
+            book_id_source = str(_safe_int(book_id_source))
+            if not book_id_source:
+                continue
+            
+            pub_date = _coerce_date(r.get("publication_date"))
+            
+            # Prioritize isbn13, fall back to isbn
+            isbn = r.get('isbn13')
+            if pd.isna(isbn):
+                isbn = r.get('isbn')
+            
+            # Clean language code (e.g., 'en-US' -> 'EN')
+            lang = r.get('language_code')
+            if pd.notna(lang):
+                lang = str(lang).upper().split('-')[0][:3]
+            else:
+                lang = None
 
-            # split on comma OR slash OR semicolon (and collapse whitespace)
-            parts = re.split(r"\s*(?:,|/|;)\s*", raw)
-            # normalize + drop empties + dedupe while preserving order
-            seen = set()
-            names = []
-            for p in parts:
-                n = p.strip()
-                if not n:
-                    continue
-                if n.lower() in seen:
-                    continue
-                seen.add(n.lower())
-                # hard cap just in case—PG now TEXT, but being tidy is fine
-                names.append(n[:500])
+            try:
+                res = c.execute(text("""
+                    INSERT INTO Dim_Book
+                        (Book_ID_Source, ISBN, Title, Author, Publisher, Publication_Date, Language_Code, Num_Pages)
+                    VALUES
+                        (:src, :isbn, :title, :author, :pub, :pub_date, :lang, :pages)
+                    ON CONFLICT (Book_ID_Source) DO UPDATE SET
+                        ISBN = EXCLUDED.ISBN,
+                        Title = EXCLUDED.Title,
+                        Author = EXCLUDED.Author,
+                        Publisher = EXCLUDED.Publisher,
+                        Publication_Date = EXCLUDED.Publication_Date,
+                        Language_Code = EXCLUDED.Language_Code,
+                        Num_Pages = EXCLUDED.Num_Pages
+                    RETURNING Book_SK
+                """), {
+                    "src": book_id_source,
+                    "isbn": str(isbn) if pd.notna(isbn) else None,
+                    "title": (r.get("title") or f"Book {book_id_source}")[:500],
+                    "author": (r.get("authors") or None)[:500] if pd.notna(r.get("authors")) else None,
+                    "pub": (r.get("publisher") or None)[:255] if pd.notna(r.get("publisher")) else None,
+                    "pub_date": pub_date,
+                    "lang": lang,
+                    "pages": _safe_int(r.get("num_pages"))
+                }).scalar()
 
-            for order, name in enumerate(names, start=1):
-                aid = author_by_name.get(name)
-                if aid is None:
-                    aid = c.execute(text("""
-                        INSERT INTO book_authors (author_name)
-                        VALUES (:n)
-                        ON CONFLICT (author_name) DO NOTHING
-                        RETURNING author_id
-                    """), {"n": name}).scalar()
-                    if aid is None:
-                        aid = c.execute(
-                            text("SELECT author_id FROM book_authors WHERE author_name=:n"),
-                            {"n": name}
-                        ).scalar()
-                    author_by_name[name] = aid
-                c.execute(text("""
-                    INSERT INTO book_author_mapping (book_id, author_id, author_order)
-                    VALUES (:bid, :aid, :ord)
-                    ON CONFLICT DO NOTHING
-                """), {"bid": int(r["book_id"]), "aid": int(aid), "ord": order})
+                if res is None: # Get SK if a conflict happened but did not return
+                    res = c.execute(text("SELECT Book_SK FROM Dim_Book WHERE Book_ID_Source=:src"), {"src": book_id_source}).scalar()
+                
+                if res is not None:
+                    book_sk = int(res)
+                    processed_books += 1
+                    
+                    # --- 4. Prepare Fact Table Update Data ---
+                    # We can do this in the same loop, it's more efficient
+                    fact_update_data.append({
+                        "bsk": book_sk,
+                        "bavg": _safe_float(r.get("average_rating"), lo=0, hi=5),
+                        "brc": _safe_int(r.get("ratings_count")),
+                        "btrc": _safe_int(r.get("text_reviews_count"))
+                    })
+            
+            except Exception as e:
+                print(f"Error processing bookID {book_id_source}: {e}")
+                continue # Skip this row and continue
 
-    print("Done: Goodreads -> books, book_authors, book_author_mapping")
+        print(f"Processed {processed_books} rows for Dim_Book.")
 
+        # --- 5. Batch Update Fact_Book_Adaptation ---
+        # This is *much* faster than updating one by one
+        if fact_update_data:
+            print(f"Backfilling {len(fact_update_data)} fact rows with new book measures...")
+            
+            # We use a temporary table for a high-performance batch update
+            # This is much faster on large datasets than row-by-row UPDATEs
+            
+            # 1. Create a temporary table
+            c.execute(text("""
+                CREATE TEMPORARY TABLE temp_book_measures (
+                    book_sk INT PRIMARY KEY,
+                    b_avg_rating DECIMAL(4, 2),
+                    b_ratings_count INT,
+                    b_text_reviews_count INT
+                ) ON COMMIT DROP;
+            """))
+            
+            # 2. Insert all our data into it
+            # We use executemany for a fast batch insert
+            c.execute(text("""
+                INSERT INTO temp_book_measures (book_sk, b_avg_rating, b_ratings_count, b_text_reviews_count)
+                VALUES (:bsk, :bavg, :brc, :btrc)
+            """), fact_update_data)
+            
+            # 3. Perform a single, fast UPDATE by joining to the temp table
+            result = c.execute(text("""
+                UPDATE Fact_Book_Adaptation f SET
+                    Book_Average_Rating = t.b_avg_rating,
+                    Book_Ratings_Count = t.b_ratings_count,
+                    Book_Text_Reviews_Count = t.b_text_reviews_count
+                FROM temp_book_measures t
+                WHERE f.Book_SK = t.book_sk; -- <-- FIXED: Overwrite existing data
+            """))
+            updated_facts = result.rowcount
+            
+    print("books.csv load complete.")
+    print(f"  Books upserted into Dim_Book: {processed_books}")
+    print(f"  Fact rows backfilled with measures: {updated_facts}")
