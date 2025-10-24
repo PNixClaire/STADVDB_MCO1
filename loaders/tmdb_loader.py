@@ -14,7 +14,6 @@ def _derive_movie_id_source_from_imdb(imdb_id: str | None) -> str | None:
     #movie natural key from IMDb so we can upsert easily
     if not imdb_id or not isinstance(imdb_id, str):
         return None
-    # --- MODIFIED: Handle 'tt' prefix or just the number ---
     m = re.search(r"tt?(\d+)", imdb_id.strip())
     return m.group(1) if m else None
 
@@ -22,7 +21,6 @@ def _coerce_date(val) -> date | None:
     if val is None:
         return None
     try:
-        # --- MODIFIED: Handle various date formats, including just year ---
         if isinstance(val, (int, float)) and 1800 < val < 2100:
              # Handle integer years
             return date(int(val), 1, 1)
@@ -54,7 +52,7 @@ def _safe_float(v, lo=None, hi=None):
     
 def _safe_int(v):
         try:
-            return int(float(v)) # --- MODIFIED: Cast via float to handle "123.0" ---
+            return int(float(v)) 
         except Exception:
             return None 
 
@@ -70,7 +68,7 @@ def _clean_currency(val) -> float | None:
     
     
 # --- THIS FUNCTION NOW HAS RETRY LOGIC ---
-# --- FUNCTION TO REPLACE (in tmdb_loader.py) ---
+
 def _get_tmdb_id(external_id, external_source_type):
     """
     Finds the TMDb ID from an IMDb ID, with retries and better debugging.
@@ -98,7 +96,6 @@ def _get_tmdb_id(external_id, external_source_type):
 
     for attempt in range(3):
         try:
-            # --- ADDED: Print URL before calling ---
             print(f"    _get_tmdb_id Attempt {attempt+1}: Calling URL: {url_to_call} with params: {params}")
 
             response = requests.get(
@@ -107,7 +104,6 @@ def _get_tmdb_id(external_id, external_source_type):
                 timeout=15
             )
 
-            # --- ADDED: Print status code and raw response text ---
             print(f"    _get_tmdb_id Response Status: {response.status_code}")
             # Only print first 200 chars in case response is huge HTML error page
             print(f"    _get_tmdb_id Response Text (first 200 chars): {response.text[:200]}")
@@ -134,7 +130,7 @@ def _get_tmdb_id(external_id, external_source_type):
                 time.sleep(wait_time)
             else:
                 print(f"  Max retries reached for {original_id}. Skipping.")
-        # --- ADDED: Catch potential JSON decode error ---
+    
         except requests.exceptions.JSONDecodeError as e:
              print(f"  Attempt {attempt + 1} failed for {original_id}: Could not decode JSON response. Error: {e}")
              # Don't retry JSON errors, likely bad response format
@@ -142,7 +138,7 @@ def _get_tmdb_id(external_id, external_source_type):
 
 
     print(f"  _get_tmdb_id Failed: All retries failed for {original_id}.") # Debug
-    return None # All retries failed
+    return None
 
 def load_dynamic_movie_data():
     print("\nStarting Dynamic Movie Data (API) load...")
@@ -166,7 +162,6 @@ def load_dynamic_movie_data():
                 continue
 
             try:
-                # --- ADDED RETRY LOGIC ---
                 data = None
                 for attempt in range(3):
                     try:
@@ -174,11 +169,11 @@ def load_dynamic_movie_data():
                         response = requests.get(
                             MOVIE_URL.format(tmdb_id=tmdb_id), 
                             params=params, 
-                            timeout=15 # Increased timeout
+                            timeout=15 
                         )
                         response.raise_for_status()
                         data = response.json()
-                        break # Success! Break the retry loop
+                        break 
                     except requests.exceptions.RequestException as e:
                         print(f"  Attempt {attempt + 1} failed for Movie_SK {movie_sk}: {e}")
                         if attempt < 2:
@@ -191,7 +186,7 @@ def load_dynamic_movie_data():
                 if data is None:
                     print(f"  Skipping Movie_SK {movie_sk} after failed retries.")
                     continue 
-                # --- END OF RETRY LOGIC ---
+          
                 
                 with c.begin():
                     c.execute(text(f"SET search_path TO {DW_SCHEMA}"))
@@ -246,8 +241,7 @@ def load_dynamic_movie_data():
     print(f"  Total fact rows updated: {facts_updated}")
 
 
-# --- LOADER 2: FOR ACTORS (NOW HAS RETRY LOGIC) ---
-# --- LOADER 2: FOR ACTORS (MODIFIED FOR DEBUGGING) ---
+
 def load_dynamic_actor_data():
     print("\nStarting Dynamic Actor Data (API) load...")
     if not TMDB_API_KEY or TMDB_API_KEY == "PASTE_YOUR_API_KEY_HERE":
@@ -258,7 +252,7 @@ def load_dynamic_actor_data():
     actors_to_check = []
     actors_updated = 0
 
-    try: # --- ADDED try block for initial query ---
+    try: 
         print("Connecting to database to fetch actors...")
         with pg.connect() as c:
             query = text(f"""
@@ -280,14 +274,14 @@ def load_dynamic_actor_data():
     with pg.connect() as c: # Re-establish connection for the loop
         for actor_sk, actor_id_source in actors_to_check:
             processed_count += 1
-            print(f"\nProcessing actor {processed_count}/{len(actors_to_check)}: SK={actor_sk}, ID={actor_id_source}") # --- ADDED ---
+            print(f"\nProcessing actor {processed_count}/{len(actors_to_check)}: SK={actor_sk}, ID={actor_id_source}") 
 
-            print(f"  Attempting to find TMDb ID for {actor_id_source}...") # --- ADDED ---
+            print(f"  Attempting to find TMDb ID for {actor_id_source}...") 
             tmdb_id = _get_tmdb_id(actor_id_source, 'imdb_id')
-            print(f"  _get_tmdb_id returned: {tmdb_id}") # --- ADDED ---
+            print(f"  _get_tmdb_id returned: {tmdb_id}")
 
             if not tmdb_id:
-                print(f"  Skipping Actor_SK {actor_sk} - TMDb ID not found.") # --- ADDED ---
+                print(f"  Skipping Actor_SK {actor_sk} - TMDb ID not found.") 
                 continue
 
             try:
@@ -295,17 +289,17 @@ def load_dynamic_actor_data():
                 data = None
                 for attempt in range(3):
                     try:
-                        print(f"    Attempt {attempt + 1}: Calling PEOPLE API for TMDb ID {tmdb_id}...") # --- ADDED ---
+                        print(f"    Attempt {attempt + 1}: Calling PEOPLE API for TMDb ID {tmdb_id}...") 
                         params = {'api_key': TMDB_API_KEY}
                         response = requests.get(
                             PERSON_URL.format(person_id=tmdb_id),
                             params=params,
                             timeout=15
                         )
-                        print(f"    API response status: {response.status_code}") # --- ADDED ---
+                        print(f"    API response status: {response.status_code}") 
                         response.raise_for_status()
                         data = response.json()
-                        print(f"    Successfully got data for TMDb ID {tmdb_id}.") # --- ADDED ---
+                        print(f"    Successfully got data for TMDb ID {tmdb_id}.") 
                         break
                     except requests.exceptions.RequestException as e:
                         print(f"  Attempt {attempt + 1} failed for Actor_SK {actor_sk} (IMDb: {actor_id_source}): {e}")
@@ -321,10 +315,10 @@ def load_dynamic_actor_data():
                     continue
 
                 pop = _safe_float(data.get('popularity'))
-                print(f"    Popularity score found: {pop}") # --- ADDED ---
+                print(f"    Popularity score found: {pop}") 
 
                 with c.begin():
-                    print(f"    Updating database for Actor_SK {actor_sk}...") # --- ADDED ---
+                    print(f"    Updating database for Actor_SK {actor_sk}...") 
                     c.execute(text(f"SET search_path TO {DW_SCHEMA}"))
                     c.execute(text("""
                         UPDATE Dim_Actor
@@ -332,7 +326,7 @@ def load_dynamic_actor_data():
                         WHERE Actor_SK = :sk
                     """), {"pop": pop, "sk": actor_sk})
                     actors_updated += 1
-                    print(f"    Database update successful for Actor_SK {actor_sk}.") # --- ADDED ---
+                    print(f"    Database update successful for Actor_SK {actor_sk}.") 
 
                 time.sleep(0.2)
 
@@ -341,7 +335,6 @@ def load_dynamic_actor_data():
                 continue
 
             if processed_count % 100 == 0:
-                 # --- MODIFIED log message slightly ---
                 print(f"\n--- Progress: Processed {processed_count}/{len(actors_to_check)} actors (updated {actors_updated}) ---\n")
 
     print("\nDynamic Actor Data load complete.")

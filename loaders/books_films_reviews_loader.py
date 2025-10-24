@@ -10,7 +10,6 @@ def _derive_movie_id_source_from_imdb(imdb_id: str | None) -> str | None:
     #movie natural key from IMDb so we can upsert easily
     if not imdb_id or not isinstance(imdb_id, str):
         return None
-    # --- MODIFIED: Handle 'tt' prefix or just the number ---
     m = re.search(r"tt?(\d+)", imdb_id.strip())
     return m.group(1) if m else None
 
@@ -18,14 +17,11 @@ def _coerce_date(val) -> date | None:
     if val is None:
         return None
     try:
-        # --- MODIFIED: Handle various date formats, including just year ---
         if isinstance(val, (int, float)) and 1800 < val < 2100:
-             # Handle integer years
             return date(int(val), 1, 1)
         
         dt = pd.to_datetime(val, errors="coerce")
         if pd.isna(dt):
-            # Try parsing just the year if full parse fails
             m = re.search(r"(\d{4})", str(val))
             if m:
                 return date(int(m.group(1)), 1, 1)
@@ -50,7 +46,7 @@ def _safe_float(v, lo=None, hi=None):
     
 def _safe_int(v):
         try:
-            return int(float(v)) # --- MODIFIED: Cast via float to handle "123.0" ---
+            return int(float(v)) 
         except Exception:
             return None 
 
@@ -93,7 +89,6 @@ def load_dw_from_bfr():
     if "tmdb_to_imdb_id_mapping" in tables:
         map_df = pd.read_sql_query("SELECT * FROM tmdb_to_imdb_id_mapping", src)
         map_df.columns = [c.strip().lower() for c in map_df.columns]
-        # --- MODIFIED: Handle column name variations ---
         tmdb_col = "tmdbid" if "tmdbid" in map_df.columns else "tmdb_id"
         imdb_col = "imdbid" if "imdbid" in map_df.columns else "imdb_id"
         
@@ -106,7 +101,6 @@ def load_dw_from_bfr():
 
     # As a fallback, try to infer imdb from movies_df if tmdb_id + imdb_id both exist there
     if not movies_df.empty:
-        # --- MODIFIED: Handle column name variations ---
         tmdb_col = "tmdbid" if "tmdbid" in movies_df.columns else "tmdb_id"
         imdb_col = "imdbid" if "imdbid" in movies_df.columns else "imdb_id"
 
@@ -117,7 +111,7 @@ def load_dw_from_bfr():
                 if pd.notna(t) and pd.notna(i):
                     tmdb_to_imdb[int(t)] = str(i)
     
-    # --- ADDED: Load movie genres ---
+
     imdb_to_genre = {}
     if "movie_genres" in tables:
         movie_genres_df = pd.read_sql_query("SELECT * FROM movie_genres", src)
@@ -132,7 +126,6 @@ def load_dw_from_bfr():
             imdb_to_genre = genre_groups.to_dict()
             print(f"Loaded {len(imdb_to_genre)} movie genre mappings")
 
-    # --- ADDED: Load movie actors and directors ---
     people_df = pd.DataFrame()
     imdb_to_director = {}
     actors_data = [] # Will store tuples of (imdb_key, actor_id, actor_name, role)
@@ -157,12 +150,11 @@ def load_dw_from_bfr():
                 continue
 
             if category == 'director':
-                # Assuming one primary director for simplicity
                 if imdb_key not in imdb_to_director:
                     imdb_to_director[imdb_key] = name
             
             elif category in ('actor', 'actress'):
-                role = r.get("role") or r.get("characters") # Get role if available
+                role = r.get("role") or r.get("characters") 
                 actors_data.append((imdb_key, person_id, name, role))
                 if person_id not in unique_actors:
                     unique_actors[person_id] = name
@@ -196,7 +188,6 @@ def load_dw_from_bfr():
             if not key:
                 continue
             
-            # --- MODIFIED: Grab financial data and use fallback release date ---
             release_date = _coerce_date(r.get("release_date") or r.get("year"))
 
             imdb_to_movie[key] = {
@@ -206,17 +197,17 @@ def load_dw_from_bfr():
                 "vote_average": _safe_float(r.get("averagerating") or r.get("rating_average") or r.get("vote_average"), lo=0, hi=10),
                 "vote_count": _safe_int(r.get("numvotes") or r.get("vote_count")),
                 "distributor": r.get("distributor") if "distributor" in movies_df.columns else None,
-                "genre": imdb_to_genre.get(key), # --- MODIFIED: Use reliable genre map
-                "director": imdb_to_director.get(key), # --- MODIFIED: Use reliable director map
-                "budget": _safe_int(r.get("budget")), # --- ADDED ---
-                "revenue": _safe_int(r.get("revenue")), # --- ADDED ---
+                "genre": imdb_to_genre.get(key), 
+                "director": imdb_to_director.get(key), 
+                "budget": _safe_int(r.get("budget")), 
+                "revenue": _safe_int(r.get("revenue")), 
             }
 
     # Build book measures
     book_measures = {}
     if not books_df.empty:
         for _, r in books_df.iterrows():
-            # --- MODIFIED: Handle column name variations ---
+    
             src_id = (r.get("goodreads_book_id") or r.get("book_id"))
             if pd.isna(src_id): 
                 continue
@@ -226,14 +217,14 @@ def load_dw_from_bfr():
             
             book_measures[src_id] = {
                 "title": r.get("title"),
-                "authors": r.get("author") or r.get("authors"), # --- MODIFIED ---
+                "authors": r.get("author") or r.get("authors"), 
                 "isbn": r.get("isbn"),
                 "pub_date": pub_date,
                 "language_code": (r.get("language_code") or None),
-                "num_pages": _safe_int(r.get("length") or r.get("num_pages")), # --- MODIFIED ---
-                "avg_rating": _safe_float(r.get("avg_rating") or r.get("average_rating"), lo=0, hi=5), # --- MODIFIED ---
-                "ratings_count": _safe_int(r.get("rating_count") or r.get("ratings_count")), # --- MODIFIED ---
-                "text_reviews_count": _safe_int(r.get("review_count") or r.get("work_text_reviews_count") or r.get("text_reviews_count")), # --- MODIFIED ---
+                "num_pages": _safe_int(r.get("length") or r.get("num_pages")), 
+                "avg_rating": _safe_float(r.get("avg_rating") or r.get("average_rating"), lo=0, hi=5), 
+                "ratings_count": _safe_int(r.get("rating_count") or r.get("ratings_count")), 
+                "text_reviews_count": _safe_int(r.get("review_count") or r.get("work_text_reviews_count") or r.get("text_reviews_count")),
             }
 
     # Normalize links: prefer explicit imdb; else tmdb→imdb
@@ -241,7 +232,7 @@ def load_dw_from_bfr():
     for _, r in links_df.iterrows():
         # book id
         bid = None
-        # --- MODIFIED: Handle column name variations ---
+     
         for cand in ["goodreads_book_id", "book_id", "id_goodreads"]:
             if cand in links_df.columns and pd.notna(r.get(cand)):
                 bid = str(int(r[cand])) if not isinstance(r[cand], str) else r[cand].strip()
@@ -251,7 +242,7 @@ def load_dw_from_bfr():
 
         imdb_key = None
         # common imdb columns
-        # --- MODIFIED: Handle column name variations ---
+
         for cand in ["imdb_id", "movie_imdb_id", "imdb", "ttid", "imdbid"]:
             if cand in links_df.columns and pd.notna(r.get(cand)):
                 imdb_key = _derive_movie_id_source_from_imdb(str(r[cand]))
@@ -260,7 +251,7 @@ def load_dw_from_bfr():
 
         # If only tmdb is present, try to map it
         if not imdb_key:
-             # --- MODIFIED: Handle column name variations ---
+        
             for cand in ["tmdb_id", "movie_tmdb_id", "tmdb", "tmdbid"]:
                 if cand in links_df.columns and pd.notna(r.get(cand)):
                     try:
@@ -274,11 +265,11 @@ def load_dw_from_bfr():
                         break
 
         if not imdb_key:
-            continue  # still no imdb, skip
+            continue 
 
         norm_links.append((bid, imdb_key))
     
-    # --- ADDED: De-duplicate links ---
+
     norm_links = sorted(list(set(norm_links)))
 
     print(f"Link rows discovered: {len(norm_links)}")
@@ -298,7 +289,7 @@ def load_dw_from_bfr():
 
         book_src_to_sk = {}
         movie_src_to_sk = {}
-        # --- ADDED: Actor SKU lookup ---
+
         actor_src_to_sk = {}
         inserted_facts = 0
         inserted_bridge = 0
@@ -338,11 +329,11 @@ def load_dw_from_bfr():
         for movie_src_id in sorted({m for _, m in norm_links}):
             mm = imdb_to_movie.get(movie_src_id, {})
             
-            # --- FIX: Handle potential None values before slicing ---
+     
             genre_val = mm.get("genre") or imdb_to_genre.get(movie_src_id)
             director_val = mm.get("director") or imdb_to_director.get(movie_src_id)
             
-            # --- MODIFIED: Use reliable genre/director ---
+        
             res = c.execute(text("""
                 INSERT INTO Dim_Movie
                     (Movie_ID_Source, Movie_Title_Source, Release_Date, Release_Year, Distributor, Genre, Director)
@@ -386,7 +377,7 @@ def load_dw_from_bfr():
                     ON CONFLICT (Date_SK) DO NOTHING
                 """), {"sk": dsk, "d": rdate})
 
-        # --- ADDED: Load Dim_Actor ---
+
         for actor_src_id, actor_name in unique_actors.items():
             res = c.execute(text("""
                 INSERT INTO Dim_Actor (Actor_ID_Source, Name)
@@ -401,8 +392,7 @@ def load_dw_from_bfr():
             
             if res is not None:
                 actor_src_to_sk[actor_src_id] = int(res)
-        
-        # --- ADDED: Load Bridge_Movie_Actor ---
+     
         for imdb_key, actor_id, actor_name, role in actors_data:
             msk = movie_src_to_sk.get(imdb_key)
             ask = actor_src_to_sk.get(actor_id)
@@ -429,13 +419,13 @@ def load_dw_from_bfr():
             rdate = mm.get("release_date")
             date_sk = _date_to_sk(rdate) if rdate else None
             
-            # --- ADDED: Financial Calculations ---
+      
             budget = mm.get("budget")
             revenue = mm.get("revenue")
             profit = (revenue - budget) if budget is not None and revenue is not None else None
             roi = (profit / budget * 100) if profit is not None and budget is not None and budget != 0 else None
 
-            # --- MODIFIED: Insert financial data ---
+      
             c.execute(text("""
                 INSERT INTO Fact_Book_Adaptation
                     (Book_SK, Movie_SK, Movie_Release_Date_SK,

@@ -10,7 +10,7 @@ def _derive_movie_id_source_from_imdb(imdb_id: str | None) -> str | None:
     #movie natural key from IMDb so we can upsert easily
     if not imdb_id or not isinstance(imdb_id, str):
         return None
-    # --- MODIFIED: Handle 'tt' prefix or just the number ---
+
     m = re.search(r"tt?(\d+)", imdb_id.strip())
     return m.group(1) if m else None
 
@@ -18,7 +18,7 @@ def _coerce_date(val) -> date | None:
     if val is None:
         return None
     try:
-        # --- MODIFIED: Handle various date formats, including just year ---
+
         if isinstance(val, (int, float)) and 1800 < val < 2100:
              # Handle integer years
             return date(int(val), 1, 1)
@@ -50,7 +50,7 @@ def _safe_float(v, lo=None, hi=None):
     
 def _safe_int(v):
         try:
-            return int(float(v)) # --- MODIFIED: Cast via float to handle "123.0" ---
+            return int(float(v))
         except Exception:
             return None 
 
