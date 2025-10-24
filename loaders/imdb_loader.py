@@ -25,7 +25,6 @@ def _coerce_date(val) -> date | None:
         
         dt = pd.to_datetime(val, errors="coerce")
         if pd.isna(dt):
-            # Try parsing just the year if full parse fails
             m = re.search(r"(\d{4})", str(val))
             if m:
                 return date(int(m.group(1)), 1, 1)
@@ -53,7 +52,7 @@ def _safe_int(v):
             return int(float(v))
         except Exception:
             return None 
-
+        
 def _clean_currency(val) -> float | None:
     """Removes $ and , from currency strings and converts to float."""
     if pd.isna(val):
@@ -77,7 +76,7 @@ def load_dw_from_imdb_actors():
 
     pg = create_engine(PG_URL)
     
-    # These are the columns we care about from the TSV
+    # relevant columns
     use_cols = ["nconst", "primaryName", "birthYear", "primaryProfession"]
     total_rows_processed = 0
     chunk_num = 0
@@ -95,8 +94,7 @@ def load_dw_from_imdb_actors():
         for chunk_df in chunk_iter:
             chunk_num += 1
             
-            # --- 1. Clean data in the chunk ---
-            # Rename columns to match our temp table
+            # clean chunk - rename columns to matcg dw
             chunk_df = chunk_df.rename(columns={
                 "nconst": "actor_id_source",
                 "primaryName": "name",
@@ -106,7 +104,7 @@ def load_dw_from_imdb_actors():
 
             
 
-            # Drop rows where the 'name' is null, as it violates our NOT NULL constraint
+            # Drop rows where the 'name' is null -> violates NOT NULL constraint in dw
             original_count = len(chunk_df)
             chunk_df = chunk_df.dropna(subset=['name'])
             dropped_rows = original_count - len(chunk_df)
@@ -117,19 +115,15 @@ def load_dw_from_imdb_actors():
                 lambda x: str(x)[:255] if pd.notna(x) else None
             )
 
-            # --- 2. Use a high-speed COPY for bulk upsert ---
+            # bulk upsert
             try:
-                # Get a raw connection from the engine pool
                 with pg.connect() as conn:
-                    # Start a transaction
                     with conn.begin() as trans:
 
                         conn.execute(text(f"SET search_path TO {DW_SCHEMA}"))
 
-                        # Get the underlying psycopg2 connection
                         raw_conn = conn.connection
                         
-                        # Create a temporary table just for this transaction
                         conn.execute(text("""
                             CREATE TEMPORARY TABLE temp_actors (
                                 actor_id_source VARCHAR(100),
@@ -139,20 +133,19 @@ def load_dw_from_imdb_actors():
                             ) ON COMMIT DROP;
                         """))
 
-                        # --- 3. Stream data from DataFrame to temp table ---
-                        # Create an in-memory "file"
+                        # Create an in-memory "file" -temp
                         buffer = io.StringIO()
                         chunk_df.to_csv(buffer, index=False, header=False, sep='\t', na_rep='\\N', float_format='%.0f')
                         buffer.seek(0) # Rewind the "file" to the beginning
 
-                        # Use the high-speed COPY command
+                        #copy
                         with raw_conn.cursor() as cursor:
                             cursor.copy_expert(
                                 "COPY temp_actors FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N')",
                                 buffer
                             )
                         
-                        # --- 4. Run one single "upsert" from the temp table ---
+                        #upsert chunk
                         result = conn.execute(text("""
                             INSERT INTO Dim_Actor (Actor_ID_Source, Name, Birth_Year, Primary_Profession)
                             SELECT

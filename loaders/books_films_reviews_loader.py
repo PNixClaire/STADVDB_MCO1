@@ -64,17 +64,17 @@ def load_dw_from_bfr():
     )["name"].str.lower().tolist()
     print("SQLite tables:", ", ".join(sorted(tables)))
 
-    # --- load books ---
+    # load books
     books_df = pd.DataFrame()
     if "books" in tables:
         books_df = pd.read_sql_query("SELECT * FROM books", src)
         books_df.columns = [c.strip().lower() for c in books_df.columns]
-    elif "book_data_cleaned" in tables: # --- ADDED: Fallback table ---
+    elif "book_data_cleaned" in tables: 
         books_df = pd.read_sql_query("SELECT * FROM book_data_cleaned", src)
         books_df.columns = [c.strip().lower() for c in books_df.columns]
 
 
-    # --- load movies (meta) ---
+    # movies
     movies_df = pd.DataFrame()
     for t in ["movies", "movie_overall_data"]:
         if t in tables:
@@ -84,7 +84,6 @@ def load_dw_from_bfr():
                 print(f"Loaded movie metadata from: {t}")
                 break
 
-    # Build TMDb→IMDb map if present
     tmdb_to_imdb = {}
     if "tmdb_to_imdb_id_mapping" in tables:
         map_df = pd.read_sql_query("SELECT * FROM tmdb_to_imdb_id_mapping", src)
@@ -99,7 +98,6 @@ def load_dw_from_bfr():
                 if pd.notna(t) and pd.notna(i):
                     tmdb_to_imdb[int(t)] = str(i)
 
-    # As a fallback, try to infer imdb from movies_df if tmdb_id + imdb_id both exist there
     if not movies_df.empty:
         tmdb_col = "tmdbid" if "tmdbid" in movies_df.columns else "tmdb_id"
         imdb_col = "imdbid" if "imdbid" in movies_df.columns else "imdb_id"
@@ -135,7 +133,6 @@ def load_dw_from_bfr():
         people_df = pd.read_sql_query("SELECT * FROM movie_actor_director", src)
         people_df.columns = [c.strip().lower() for c in people_df.columns]
         
-        # Use 'tconst' or 'imdbid' for movie ID, 'nconst' for person ID
         movie_id_col = "tconst" if "tconst" in people_df.columns else "imdbid"
         person_id_col = "nconst" if "nconst" in people_df.columns else "person_id"
         name_col = "primaryname" if "primaryname" in people_df.columns else "name"
@@ -163,7 +160,7 @@ def load_dw_from_bfr():
         print(f"Loaded {len(unique_actors)} unique actors")
 
 
-    # --- load link table ---
+    #book to movie link table
     links_df = pd.DataFrame()
     prefers = ["wiki_book_movie_ids_matching", "booksmovies"]
     for t in prefers:
@@ -176,9 +173,6 @@ def load_dw_from_bfr():
         print("No mapping table (booksmovies/wiki_book_movie_ids_matching) found. Exiting.")
         src.close()
         return
-
-    # Build movie lookup by imdb numeric key
-    # (Helper functions _derive_movie_id_source_from_imdb and _coerce_date are defined above)
     
     imdb_to_movie = {}
     if not movies_df.empty:
@@ -203,7 +197,7 @@ def load_dw_from_bfr():
                 "revenue": _safe_int(r.get("revenue")), 
             }
 
-    # Build book measures
+    # book measures
     book_measures = {}
     if not books_df.empty:
         for _, r in books_df.iterrows():
@@ -227,7 +221,7 @@ def load_dw_from_bfr():
                 "text_reviews_count": _safe_int(r.get("review_count") or r.get("work_text_reviews_count") or r.get("text_reviews_count")),
             }
 
-    # Normalize links: prefer explicit imdb; else tmdb→imdb
+    # Normalize links
     norm_links = []
     for _, r in links_df.iterrows():
         # book id
@@ -274,7 +268,7 @@ def load_dw_from_bfr():
 
     print(f"Link rows discovered: {len(norm_links)}")
 
-    # If zero links, give a quick diagnostic tip
+    # If zero links
     if len(norm_links) == 0:
         print("No links were matched. Check which ID columns exist:")
         print(f"  Link table ({prefers[0]}) columns:", list(links_df.columns))
@@ -283,7 +277,7 @@ def load_dw_from_bfr():
         print("DW load complete: 0 rows inserted.")
         return
 
-    # ---- load into DW ----
+    # load into dw
     with pg.begin() as c:
         c.execute(text(f"SET search_path TO {DW_SCHEMA}"))
 
@@ -377,7 +371,7 @@ def load_dw_from_bfr():
                     ON CONFLICT (Date_SK) DO NOTHING
                 """), {"sk": dsk, "d": rdate})
 
-
+        #dim actor
         for actor_src_id, actor_name in unique_actors.items():
             res = c.execute(text("""
                 INSERT INTO Dim_Actor (Actor_ID_Source, Name)

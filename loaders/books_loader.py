@@ -67,9 +67,9 @@ def load_dw_from_books_csv():
 
     pg = create_engine(PG_URL)
     
-    # --- 1. Read CSV ---
+    #Read CSV 
     try:
-        # Use on_bad_lines='skip' as this CSV is known to have some formatting errors
+        # skip bad lines
         books_df = pd.read_csv(BOOKS_PATH, on_bad_lines='skip') 
     except Exception as e:
         print(f"Error reading CSV file at {BOOKS_PATH}: {e}")
@@ -77,7 +77,7 @@ def load_dw_from_books_csv():
         
     books_df.columns = [c.strip().lower() for c in books_df.columns]
 
-    # --- 2. Check for essential column ---
+    # search for the relevant cols
     if 'bookid' not in books_df.columns:
         print("Error: 'bookID' column not found. Check CSV header.")
         print(f"Found columns: {books_df.columns.tolist()}")
@@ -93,13 +93,13 @@ def load_dw_from_books_csv():
         c.execute(text(f"SET search_path TO {DW_SCHEMA}"))
         print("Upserting data into Dim_Book...")
 
-        # --- 3. Upsert Dim_Book ---
+        # Upsert Dim_Book 
         for _, r in books_df.iterrows():
             book_id_source = r.get('bookid')
             if pd.isna(book_id_source):
                 continue
             
-            # Clean book_id_source (it's often a float: 1.0) to match our string key
+            # Clean book_id_source
             book_id_source = str(_safe_int(book_id_source))
             if not book_id_source:
                 continue
@@ -151,8 +151,7 @@ def load_dw_from_books_csv():
                     book_sk = int(res)
                     processed_books += 1
                     
-                    # --- 4. Prepare Fact Table Update Data ---
-                    # We can do this in the same loop, it's more efficient
+                    #Prepare Fact Table Update Data 
                     fact_update_data.append({
                         "bsk": book_sk,
                         "bavg": _safe_float(r.get("average_rating"), lo=0, hi=5),
@@ -162,19 +161,15 @@ def load_dw_from_books_csv():
             
             except Exception as e:
                 print(f"Error processing bookID {book_id_source}: {e}")
-                continue # Skip this row and continue
+                continue 
 
         print(f"Processed {processed_books} rows for Dim_Book.")
 
-        # --- 5. Batch Update Fact_Book_Adaptation ---
-        # This is *much* faster than updating one by one
+        # Batch Update Fact_Book_Adaptation 
         if fact_update_data:
             print(f"Backfilling {len(fact_update_data)} fact rows with new book measures...")
             
-            # We use a temporary table for a high-performance batch update
-            # This is much faster on large datasets than row-by-row UPDATEs
-            
-            # 1. Create a temporary table
+            # Create a temporary table
             c.execute(text("""
                 CREATE TEMPORARY TABLE temp_book_measures (
                     book_sk INT PRIMARY KEY,
@@ -184,14 +179,13 @@ def load_dw_from_books_csv():
                 ) ON COMMIT DROP;
             """))
             
-            # 2. Insert all our data into it
-            # We use executemany for a fast batch insert
+            # Insert data
             c.execute(text("""
                 INSERT INTO temp_book_measures (book_sk, b_avg_rating, b_ratings_count, b_text_reviews_count)
                 VALUES (:bsk, :bavg, :brc, :btrc)
             """), fact_update_data)
             
-            # 3. Perform a single, fast UPDATE by joining to the temp table
+            # join to temp table
             result = c.execute(text("""
                 UPDATE Fact_Book_Adaptation f SET
                     Book_Average_Rating = t.b_avg_rating,

@@ -85,7 +85,6 @@ def load_dw_from_box_office():
         print(f"Error reading CSV file at {BOX_OFFICE_PATH}: {e}")
         return
 
-    # Clean column names based on the images
     col_map = {}
     for col in df.columns:
         c = col.lower().strip()
@@ -120,7 +119,7 @@ def load_dw_from_box_office():
             
             if pd.isna(title) or not release_date:
                 skipped_rows += 1
-                continue # Need title and date to match
+                continue 
 
             release_year = release_date.year
             
@@ -131,7 +130,7 @@ def load_dw_from_box_office():
             """), {"title": title, "year": release_year}).scalar()
             
             if movie_sk:
-                # 1. Update Dim_Movie
+                #Update Dim_Movie
                 c.execute(text("""
                     UPDATE Dim_Movie SET
                         Distributor = COALESCE(:dist, Distributor),
@@ -144,7 +143,7 @@ def load_dw_from_box_office():
                 })
                 updated_dims += 1
                 
-                # 2. Update Fact_Book_Adaptation
+                #Update Fact_Book_Adaptation
                 gross_val = _clean_currency(r.get('gross'))
                 tickets_val = _safe_int(str(r.get('tickets')).replace(",", ""))
 
@@ -163,8 +162,6 @@ def load_dw_from_box_office():
                     updated_facts += 1
             else:
                 skipped_rows += 1
-                # Optional: Log which movies were skipped
-                # print(f"Skipping '{title} ({release_year})': Not found in Dim_Movie.")
 
     print("Box Office (CSV) load complete.")
     print(f"  Rows processed: {len(df)}")

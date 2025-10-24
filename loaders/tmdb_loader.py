@@ -6,6 +6,7 @@ from config import PG_URL, TMDB_API_KEY
 
 DW_SCHEMA = "dw_books_movies" #our star schema where the data will be loaded
 
+#endpoints
 FIND_URL = "https://api.themoviedb.org/3/find/{external_id}"
 MOVIE_URL = "https://api.themoviedb.org/3/movie/{tmdb_id}"
 PERSON_URL = "https://api.themoviedb.org/3/person/{person_id}"
@@ -27,7 +28,6 @@ def _coerce_date(val) -> date | None:
         
         dt = pd.to_datetime(val, errors="coerce")
         if pd.isna(dt):
-            # Try parsing just the year if full parse fails
             m = re.search(r"(\d{4})", str(val))
             if m:
                 return date(int(m.group(1)), 1, 1)
@@ -67,60 +67,63 @@ def _clean_currency(val) -> float | None:
         return None
     
     
-# --- THIS FUNCTION NOW HAS RETRY LOGIC ---
-
-def _get_tmdb_id(external_id, external_source_type):
+def _get_tmdb_id(external_id, find_type): # find_type is 'movie' or 'person'
     """
-    Finds the TMDb ID from an IMDb ID, with retries and better debugging.
+    Finds the TMDb ID from an IMDb ID, with retries and strict type checking.
     """
     if not external_id:
-        print("  _get_tmdb_id: Received empty external_id.") # Debug
+        print("  _get_tmdb_id: Received empty external_id.")
         return None
 
-    original_id = external_id # Keep original for logging
+    original_id = external_id
 
-    # Add 'tt' prefix for movies, 'nm' for actors if missing
-    if external_source_type == 'imdb_id':
-        if not external_id.startswith('tt') and not external_id.startswith('nm'):
-            if len(str(external_id)) >= 7 and str(external_id).isdigit():
-                 external_id = f"nm{external_id.zfill(7)}"
-            else:
-                 external_id = f"tt{external_id.zfill(7)}"
-        elif external_id.startswith('tt') and len(external_id) < 9:
-             external_id = f"tt{external_id[2:].zfill(7)}"
-        elif external_id.startswith('nm') and len(external_id) < 9:
-             external_id = f"nm{external_id[2:].zfill(7)}"
+    #check if actor or movie
+    if find_type == 'movie':
+        if external_id.startswith('nm'):
+            print(f"  _get_tmdb_id: ID {external_id} is a PERSON ID, but we are looking for a MOVIE. Skipping.")
+            return None 
+        if not external_id.startswith('tt'):
+            external_id = f"tt{external_id.zfill(7)}"
+            
+    elif find_type == 'person':
+        if external_id.startswith('tt'):
+            print(f"  _get_tmdb_id: ID {external_id} is a MOVIE ID, but we are looking for a PERSON. Skipping.")
+            return None 
+        if not external_id.startswith('nm'):
+            external_id = f"nm{external_id.zfill(7)}"
+   
 
     params = {'api_key': TMDB_API_KEY, 'external_source': 'imdb_id'}
-    url_to_call = FIND_URL.format(external_id=external_id) # --- Store URL for logging ---
+    url_to_call = FIND_URL.format(external_id=external_id)
 
     for attempt in range(3):
         try:
-            print(f"    _get_tmdb_id Attempt {attempt+1}: Calling URL: {url_to_call} with params: {params}")
-
+            print(f"    _get_tmdb_id Attempt {attempt+1}: Calling URL: {url_to_call}")
             response = requests.get(
                 url_to_call,
                 params=params,
                 timeout=15
             )
-
             print(f"    _get_tmdb_id Response Status: {response.status_code}")
-            # Only print first 200 chars in case response is huge HTML error page
             print(f"    _get_tmdb_id Response Text (first 200 chars): {response.text[:200]}")
 
-            response.raise_for_status() # Raise error if 4xx or 5xx
+            response.raise_for_status()
             data = response.json()
 
-            results_key = 'person_results' if external_source_type == 'imdb_id' and external_id.startswith('nm') else 'movie_results'
-            results = data.get(results_key)
+            #seachr for movie or person
+            if find_type == 'movie':
+                results = data.get('movie_results')
+            else: 
+                results = data.get('person_results')
+           
 
             if results:
                 tmdb_id = results[0].get('id')
-                print(f"    _get_tmdb_id Success: Found TMDb ID {tmdb_id} for {original_id}") # Debug
+                print(f"    _get_tmdb_id Success: Found TMDb ID {tmdb_id} for {original_id}")
                 return tmdb_id
             else:
-                print(f"    _get_tmdb_id Failed: API returned success, but no results found for {original_id}") # Debug
-                return None # Found no results
+                print(f"    _get_tmdb_id Failed: API returned success, but no {find_type} results found for {original_id}")
+                return None
 
         except requests.exceptions.RequestException as e:
             print(f"  Attempt {attempt + 1} failed for {original_id}: {e}")
@@ -130,14 +133,11 @@ def _get_tmdb_id(external_id, external_source_type):
                 time.sleep(wait_time)
             else:
                 print(f"  Max retries reached for {original_id}. Skipping.")
-    
         except requests.exceptions.JSONDecodeError as e:
              print(f"  Attempt {attempt + 1} failed for {original_id}: Could not decode JSON response. Error: {e}")
-             # Don't retry JSON errors, likely bad response format
              return None
 
-
-    print(f"  _get_tmdb_id Failed: All retries failed for {original_id}.") # Debug
+    print(f"  _get_tmdb_id Failed: All retries failed for {original_id}.")
     return None
 
 def load_dynamic_movie_data():
@@ -151,16 +151,30 @@ def load_dynamic_movie_data():
     movies_updated = 0
     facts_updated = 0
 
+    #get list of movies to chekc
+    try:
+        print("Connecting to database to fetch movies...")
+        with pg.connect() as c: 
+            result = c.execute(text(f"SELECT movie_sk, movie_id_source FROM {DW_SCHEMA}.\"dim_movie\""))        
+            movies_to_check = result.fetchall()
+        print(f"Found {len(movies_to_check)} movies in dim_movie to update.")
+    except Exception as e:
+         print(f"!!! DATABASE ERROR fetching movies: {e}")
+         return # Stop if we can't get the movie list
+    
+    #process
+    processed_count = 0
     with pg.connect() as c: 
-        result = c.execute(text(f"SELECT Movie_SK, Movie_ID_Source FROM {DW_SCHEMA}.Dim_Movie"))
-        movies_to_check = result.fetchall()
-        print(f"Found {len(movies_to_check)} movies in Dim_Movie to update.")
-        
         for movie_sk, movie_id_source in movies_to_check:
-            tmdb_id = _get_tmdb_id(movie_id_source, 'imdb_id')
+            processed_count += 1
+            
+            #Find TMDb ID
+            tmdb_id = _get_tmdb_id(movie_id_source, 'movie') # Use 'movie' type
             if not tmdb_id:
+                print(f"  Skipping Movie_SK {movie_sk} - TMDb ID not found or was not a movie.")
                 continue
 
+            #Call MOVIES > Details endpoint
             try:
                 data = None
                 for attempt in range(3):
@@ -169,7 +183,7 @@ def load_dynamic_movie_data():
                         response = requests.get(
                             MOVIE_URL.format(tmdb_id=tmdb_id), 
                             params=params, 
-                            timeout=15 
+                            timeout=15
                         )
                         response.raise_for_status()
                         data = response.json()
@@ -181,63 +195,27 @@ def load_dynamic_movie_data():
                             print(f"  Retrying in {wait_time} seconds...")
                             time.sleep(wait_time)
                         else:
-                            raise # Max retries reached, re-raise the exception
+                            raise 
                 
                 if data is None:
                     print(f"  Skipping Movie_SK {movie_sk} after failed retries.")
                     continue 
-          
                 
-                with c.begin():
+                
+                with c.begin(): 
                     c.execute(text(f"SET search_path TO {DW_SCHEMA}"))
-                    
-                    pop = _safe_float(data.get('popularity'))
-                    c.execute(text("""
-                        UPDATE Dim_Movie
-                        SET TMDb_Popularity = :pop
-                        WHERE Movie_SK = :sk
-                    """), {"pop": pop, "sk": movie_sk})
-                    # movies_updated count happens implicitly below if fact update succeeds
 
-                    budget = _safe_int(data.get('budget'))
-                    revenue = _safe_int(data.get('revenue'))
-                    profit = (revenue - budget) if budget is not None and revenue is not None else None
-                    roi = (profit / budget * 100) if profit is not None and budget is not None and budget > 0 else None
-
-                    # Only count update if fact update succeeds as well
-                    fact_res = c.execute(text("""
-                        UPDATE Fact_Book_Adaptation SET
-                            Production_Budget = :budget,
-                            Box_Office_Gross = :revenue,
-                            Profit = :profit,
-                            ROI = :roi
-                        WHERE Movie_SK = :sk
-                    """), {
-                        "budget": budget,
-                        "revenue": revenue,
-                        "profit": profit,
-                        "roi": roi,
-                        "sk": movie_sk
-                    })
-                    
-                    # Check if the fact table was actually updated
-                    if fact_res.rowcount > 0:
-                         movies_updated += 1 # Count movie update only if fact existed
-                         facts_updated += 1
-                    # If fact update didn't happen (rowcount=0), maybe still update Dim_Movie popularity?
-                    # Current logic only increments if fact is updated. Adjust if needed.
-
-                time.sleep(0.2) # Slightly increased polite delay
+                time.sleep(0.2) 
                 
-            except Exception as e: # Catch the error if retries fail
+            except Exception as e: 
                 print(f"  Failed to process Movie_SK {movie_sk} after 3 attempts. Skipping. Error: {e}")
                 continue
             
-            if movies_updated > 0 and movies_updated % 100 == 0:
-                print(f"  ...updated {movies_updated} movies and {facts_updated} fact rows...")
+            if processed_count % 100 == 0:
+                print(f"  ...processed {processed_count}/{len(movies_to_check)} movies (updated {facts_updated} fact rows)...")
 
     print("Dynamic Movie Data load complete.")
-    print(f"  Total movies updated (in Dim_Movie and Fact): {movies_updated}")
+    print(f"  Total movies processed: {processed_count}")
     print(f"  Total fact rows updated: {facts_updated}")
 
 
@@ -266,9 +244,9 @@ def load_dynamic_actor_data():
             result = c.execute(query)
             actors_to_check = result.fetchall()
             print(f"Found {len(actors_to_check)} linked actors in Bridge_Movie_Actor to update.")
-    except Exception as e: # --- ADDED exception handling ---
+    except Exception as e: 
          print(f"!!! DATABASE ERROR fetching actors: {e}")
-         return # Stop if we can't get the actor list
+         return 
 
     processed_count = 0
     with pg.connect() as c: # Re-establish connection for the loop
@@ -277,7 +255,7 @@ def load_dynamic_actor_data():
             print(f"\nProcessing actor {processed_count}/{len(actors_to_check)}: SK={actor_sk}, ID={actor_id_source}") 
 
             print(f"  Attempting to find TMDb ID for {actor_id_source}...") 
-            tmdb_id = _get_tmdb_id(actor_id_source, 'imdb_id')
+            tmdb_id = _get_tmdb_id(actor_id_source, 'person')
             print(f"  _get_tmdb_id returned: {tmdb_id}")
 
             if not tmdb_id:
@@ -285,7 +263,7 @@ def load_dynamic_actor_data():
                 continue
 
             try:
-                # (Keep the existing retry logic inside here)
+            
                 data = None
                 for attempt in range(3):
                     try:
