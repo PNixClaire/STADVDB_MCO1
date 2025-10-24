@@ -1,109 +1,267 @@
-import time, json, requests
+import pandas as pd
+import os, re, io, requests, time
 from sqlalchemy import create_engine, text
+from datetime import datetime, date
 from config import PG_URL, TMDB_API_KEY
 
-BASE = "https://api.themoviedb.org/3"
-S = requests.Session()
+DW_SCHEMA = "dw_books_movies" #our star schema where the data will be loaded
 
-def _get(path, **params):
-    from config import TMDB_API_KEY
-    headers = {}
-    if TMDB_API_KEY and TMDB_API_KEY.startswith("eyJ"):
-        # v4 access token
-        headers["Authorization"] = f"Bearer {TMDB_API_KEY}"
-    else:
-        # v3 api key fallback
-        params["api_key"] = TMDB_API_KEY
-    r = S.get(f"{BASE}{path}", params=params, headers=headers, timeout=30)
-    r.raise_for_status()
-    return r.json()
-def load_tmdb():
-    if not TMDB_API_KEY:
-        print("TMDB_API_KEY missing in .env")
+#ENDPOINTS
+FIND_URL = "https://api.themoviedb.org/3/find/{external_id}"
+MOVIE_URL = "https://api.themoviedb.org/3/movie/{tmdb_id}"
+PERSON_URL = "https://api.themoviedb.org/3/person/{person_id}"
+
+def _derive_movie_id_source_from_imdb(imdb_id: str | None) -> str | None:
+    #movie natural key from IMDb so we can upsert easily
+    if not imdb_id or not isinstance(imdb_id, str):
+        return None
+    # --- MODIFIED: Handle 'tt' prefix or just the number ---
+    m = re.search(r"tt?(\d+)", imdb_id.strip())
+    return m.group(1) if m else None
+
+def _coerce_date(val) -> date | None:
+    if val is None:
+        return None
+    try:
+        # --- MODIFIED: Handle various date formats, including just year ---
+        if isinstance(val, (int, float)) and 1800 < val < 2100:
+             # Handle integer years
+            return date(int(val), 1, 1)
+        
+        dt = pd.to_datetime(val, errors="coerce")
+        if pd.isna(dt):
+            # Try parsing just the year if full parse fails
+            m = re.search(r"(\d{4})", str(val))
+            if m:
+                return date(int(m.group(1)), 1, 1)
+            return None
+        return dt.date()
+    except Exception:
+        return None
+
+#date
+def _date_to_sk(d: date) -> int:
+    # YYYYMMDD as int
+    return d.year * 10000 + d.month * 100 + d.day
+
+def _safe_float(v, lo=None, hi=None):
+    try:
+        f = float(v)
+        if lo is not None and f < lo: return None
+        if hi is not None and f > hi: return None
+        return f
+    except Exception:
+        return None
+    
+def _safe_int(v):
+        try:
+            return int(float(v)) # --- MODIFIED: Cast via float to handle "123.0" ---
+        except Exception:
+            return None 
+
+def _clean_currency(val) -> float | None:
+    """Removes $ and , from currency strings and converts to float."""
+    if pd.isna(val):
+        return None
+    try:
+        s = str(val).replace("$", "").replace(",", "")
+        return _safe_float(s)
+    except Exception:
+        return None
+    
+API_HEADERS = {
+    "accept": "application/json",
+    "Authorization": f"Bearer {TMDB_API_KEY}"
+}
+
+def _get_tmdb_id(external_id, external_source_type):
+    """
+    Finds the TMDb ID from an IMDb ID using the /find endpoint.
+    external_source_type can be 'imdb_id' for movies or actors.
+    """
+    if not external_id:
+        return None
+    
+    # Add 'tt' prefix for movies, 'nm' for actors if missing
+    if external_source_type == 'imdb_id':
+        if not external_id.startswith('tt') and not external_id.startswith('nm'):
+            # This is a guess; movies use 'tt', actors use 'nm'
+            # We'll rely on the source type to be correct
+            if len(external_id) > 8: # nm1234567
+                external_id = f"nm{external_id.zfill(7)}"
+            else:
+                external_id = f"tt{external_id.zfill(7)}" # tt1234567
+    
+    try:
+        params = {'external_source': 'imdb_id'}
+        response = requests.get(
+            FIND_URL.format(external_id=external_id), 
+            params=params, 
+            headers=API_HEADERS 
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        results = data.get('movie_results') if external_source_type == 'imdb_id' else data.get('person_results')
+        if results:
+            return results[0].get('id')
+    except requests.exceptions.RequestException as e:
+        print(f"  API Error finding {external_id}: {e}")
+    
+    return None
+
+
+def load_dynamic_movie_data():
+    """
+    Loops through all movies in Dim_Movie, fetches dynamic data from TMDb,
+    and updates Dim_Movie and Fact_Book_Adaptation.
+    """
+    print("\nStarting Dynamic Movie Data (API) load...")
+    if not TMDB_API_KEY or TMDB_API_KEY == "PASTE_YOUR_API_KEY_HERE":
+        print("Error: TMDB_API_KEY not set. Skipping load.")
         return
 
-    engine = create_engine(PG_URL)
-    # Seed IDs to fetch: pick any movies already inserted (e.g., via SQLite/Goodreads mapping) that have tmdb_id
-    with engine.begin() as c:
-        c.execute(text("SET search_path TO source_books_movies"))
-        rows = c.execute(text("""
-            SELECT DISTINCT tmdb_id FROM movies WHERE tmdb_id IS NOT NULL
-            UNION
-            SELECT DISTINCT movie_id FROM movie_reviews WHERE movie_id IS NOT NULL
-            LIMIT 200
-        """)).fetchall()
-    ids = [r[0] for r in rows] or [603, 155, 597]
+    pg = create_engine(PG_URL)
+    movies_to_check = []
+    movies_updated = 0
+    facts_updated = 0
 
-    for i, mid in enumerate(ids, 1):
-        try:
-            core    = _get(f"/movie/{mid}")
-            credits = _get(f"/movie/{mid}/credits")
+    with pg.connect() as c: # Use .connect() for better control
+        # Get all movies from our DW
+        result = c.execute(text(f"SELECT Movie_SK, Movie_ID_Source FROM {DW_SCHEMA}.Dim_Movie"))
+        movies_to_check = result.fetchall()
+        print(f"Found {len(movies_to_check)} movies in Dim_Movie to update.")
+        
+        for movie_sk, movie_id_source in movies_to_check:
+            # 1. Find TMDb ID
+            tmdb_id = _get_tmdb_id(movie_id_source, 'imdb_id')
+            if not tmdb_id:
+                # print(f"  Skipping Movie_SK {movie_sk}: Could not find TMDb ID for {movie_id_source}")
+                continue
 
-            with engine.begin() as c:
-                c.execute(text("SET search_path TO source_books_movies"))
-                # movies.upsert (movie_id := tmdb_id)
-                c.execute(text("""
-                INSERT INTO movies
-                (movie_id, tmdb_id, imdb_id, title, original_title, original_language, overview, tagline,
-                 status, release_date, runtime, budget, revenue, popularity, vote_average, vote_count,
-                 adult, video, homepage, poster_path, backdrop_path)
-                VALUES
-                (:id, :id, :imdb, :t, :ot, :lang, :ov, :tg, :st, :rd, :rt, :bud, :rev, :pop, :va, :vc,
-                 :ad, :vid, :home, :pp, :bp)
-                ON CONFLICT (movie_id) DO UPDATE SET
-                  title=EXCLUDED.title, original_title=EXCLUDED.original_title,
-                  original_language=EXCLUDED.original_language, overview=EXCLUDED.overview,
-                  tagline=EXCLUDED.tagline, status=EXCLUDED.status, release_date=EXCLUDED.release_date,
-                  runtime=EXCLUDED.runtime, budget=EXCLUDED.budget, revenue=EXCLUDED.revenue,
-                  popularity=EXCLUDED.popularity, vote_average=EXCLUDED.vote_average, vote_count=EXCLUDED.vote_count,
-                  adult=EXCLUDED.adult, video=EXCLUDED.video, homepage=EXCLUDED.homepage,
-                  poster_path=EXCLUDED.poster_path, backdrop_path=EXCLUDED.backdrop_path, updated_at=now();
-                """), {
-                    "id": core["id"], "imdb": (core.get("imdb_id") or None),
-                    "t": core.get("title"), "ot": core.get("original_title"),
-                    "lang": core.get("original_language"), "ov": core.get("overview"), "tg": core.get("tagline"),
-                    "st": core.get("status"), "rd": core.get("release_date"), "rt": core.get("runtime"),
-                    "bud": core.get("budget"), "rev": core.get("revenue"), "pop": core.get("popularity"),
-                    "va": core.get("vote_average"), "vc": core.get("vote_count"), "ad": core.get("adult"),
-                    "vid": core.get("video"), "home": core.get("homepage"), "pp": core.get("poster_path"),
-                    "bp": core.get("backdrop_path")
-                })
-                # genres + link
-                for g in core.get("genres", []):
+            # 2. Call MOVIES > Details endpoint
+            try:
+                response = requests.get(
+                    MOVIE_URL.format(tmdb_id=tmdb_id), 
+                    headers=API_HEADERS
+                )
+                response.raise_for_status()
+                data = response.json()
+                
+                # We got data! Start a transaction to update
+                with c.begin():
+                    c.execute(text(f"SET search_path TO {DW_SCHEMA}"))
+                    
+                    # 3. Update Dim_Movie with new popularity
+                    pop = _safe_float(data.get('popularity'))
                     c.execute(text("""
-                      INSERT INTO genres (genre_id, genre_name, media_type)
-                      VALUES (:gid, :name, 'movie')
-                      ON CONFLICT (genre_id) DO UPDATE SET genre_name=EXCLUDED.genre_name;
-                    """), {"gid": g["id"], "name": g["name"]})
+                        UPDATE Dim_Movie
+                        SET TMDb_Popularity = :pop
+                        WHERE Movie_SK = :sk
+                    """), {"pop": pop, "sk": movie_sk})
+                    movies_updated += 1
+                    
+                    # 4. Update Fact_Book_Adaptation with new financials
+                    budget = _safe_int(data.get('budget'))
+                    revenue = _safe_int(data.get('revenue'))
+                    profit = (revenue - budget) if budget is not None and revenue is not None else None
+                    roi = (profit / budget * 100) if profit is not None and budget is not None and budget > 0 else None
+
                     c.execute(text("""
-                      INSERT INTO movie_genres (movie_id, genre_id, is_primary_genre)
-                      VALUES (:mid, :gid, false)
-                      ON CONFLICT DO NOTHING;
-                    """), {"mid": core["id"], "gid": g["id"]})
-                # people + cast/crew
-                for p in credits.get("cast", []) + credits.get("crew", []):
+                        UPDATE Fact_Book_Adaptation SET
+                            Production_Budget = :budget,
+                            Box_Office_Gross = :revenue,
+                            Profit = :profit,
+                            ROI = :roi
+                        WHERE Movie_SK = :sk
+                    """), {
+                        "budget": budget,
+                        "revenue": revenue,
+                        "profit": profit,
+                        "roi": roi,
+                        "sk": movie_sk
+                    })
+                    facts_updated += 1
+                
+                # Be polite to the API
+                time.sleep(0.1)
+                
+            except requests.exceptions.RequestException as e:
+                print(f"  Error processing Movie_SK {movie_sk} (TMDb ID {tmdb_id}): {e}")
+                continue
+            
+            if movies_updated % 100 == 0:
+                print(f"  ...updated {movies_updated} movies and {facts_updated} fact rows...")
+
+    print("Dynamic Movie Data load complete.")
+    print(f"  Total movies updated: {movies_updated}")
+    print(f"  Total fact rows updated: {facts_updated}")
+
+
+# --- LOADER 2: FOR ACTORS ---
+def load_dynamic_actor_data():
+    """
+    Loops through actors *who are in our movies* and gets their
+    popularity score from TMDb.
+    """
+    print("\nStarting Dynamic Actor Data (API) load...")
+    if not TMDB_API_KEY or TMDB_API_KEY == "PASTE_YOUR_API_KEY_HERE":
+        print("Error: TMDB_API_KEY not set. Skipping load.")
+        return
+        
+    pg = create_engine(PG_URL)
+    actors_to_check = []
+    actors_updated = 0
+
+    with pg.connect() as c:
+        # Get only the actors linked to our movies
+        query = text(f"""
+            SELECT DISTINCT
+                a.Actor_SK,
+                a.Actor_ID_Source
+            FROM {DW_SCHEMA}.Dim_Actor a
+            JOIN {DW_SCHEMA}.Bridge_Movie_Actor b ON a.Actor_SK = b.Actor_SK
+        """)
+        result = c.execute(query)
+        actors_to_check = result.fetchall()
+        print(f"Found {len(actors_to_check)} linked actors in Bridge_Movie_Actor to update.")
+        
+        for actor_sk, actor_id_source in actors_to_check:
+            # 1. Find TMDb ID for the person
+            tmdb_id = _get_tmdb_id(actor_id_source, 'imdb_id')
+            if not tmdb_id:
+                # print(f"  Skipping Actor_SK {actor_sk}: Could not find TMDb ID for {actor_id_source}")
+                continue
+                
+            # 2. Call PEOPLE > Details endpoint
+            try:
+                response = requests.get(
+                    PERSON_URL.format(person_id=tmdb_id), 
+                    headers=API_HEADERS)
+                response.raise_for_status()
+                data = response.json()
+                
+                pop = _safe_float(data.get('popularity'))
+                
+                # 3. Update Dim_Actor
+                with c.begin():
+                    c.execute(text(f"SET search_path TO {DW_SCHEMA}"))
                     c.execute(text("""
-                      INSERT INTO people (person_id, tmdb_id, name, gender, popularity, profile_path)
-                      VALUES (:id, :id, :name, :gender, :pop, :photo)
-                      ON CONFLICT (person_id) DO UPDATE SET name=EXCLUDED.name, gender=EXCLUDED.gender,
-                        popularity=EXCLUDED.popularity, profile_path=EXCLUDED.profile_path;
-                    """), {"id": p["id"], "name": p.get("name"), "gender": p.get("gender"),
-                             "pop": p.get("popularity"), "photo": p.get("profile_path")})
-                for cs in credits.get("cast", []):
-                    c.execute(text("""
-                      INSERT INTO movie_cast (movie_id, person_id, character_name, cast_order, billing_position, is_lead_role)
-                      VALUES (:mid, :pid, :char, :ord, :bill, :lead)
-                    """), {"mid": mid, "pid": cs["id"], "char": cs.get("character"),
-                             "ord": cs.get("order"), "bill": cs.get("billing"), "lead": (cs.get("order", 99) <= 2)})
-                for cr in credits.get("crew", []):
-                    c.execute(text("""
-                      INSERT INTO movie_crew (movie_id, person_id, job, department, is_key_creative)
-                      VALUES (:mid, :pid, :job, :dept, :key)
-                      ON CONFLICT (movie_id, person_id, job) DO NOTHING;
-                    """), {"mid": mid, "pid": cr["id"], "job": cr.get("job"), "dept": cr.get("department"),
-                             "key": cr.get("job") in ("Director","Writer","Producer")})
-            print(f"{i}/{len(ids)} {mid} {core.get('title')}")
-            time.sleep(0.35)
-        except Exception as e:
-            print(f"{mid}: {e}")
-            time.sleep(1)
+                        UPDATE Dim_Actor
+                        SET Popularity_Score = :pop
+                        WHERE Actor_SK = :sk
+                    """), {"pop": pop, "sk": actor_sk})
+                    actors_updated += 1
+                
+                # Be polite to the API
+                time.sleep(0.1)
+
+            except requests.exceptions.RequestException as e:
+                print(f"  Error processing Actor_SK {actor_sk} (TMDb ID {tmdb_id}): {e}")
+                continue
+            
+            if actors_updated % 100 == 0:
+                print(f"  ...updated {actors_updated} actors...")
+
+    print("Dynamic Actor Data load complete.")
+    print(f"  Total actors updated with popularity: {actors_updated}")
